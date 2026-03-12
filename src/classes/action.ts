@@ -392,6 +392,7 @@ export class KaminoAction {
     },
     referrer: Option<Address> = none(),
     currentSlot: Slot = 0n,
+    payer: TransactionSigner = owner,
     overrideElevationGroupRequest: number | undefined = undefined // if set, when an elevationgroup request is made, it will use this value
   ) {
     const axn = await KaminoAction.initialize(
@@ -402,7 +403,8 @@ export class KaminoAction {
       kaminoMarket,
       obligation,
       referrer,
-      currentSlot
+      currentSlot,
+      payer
     );
     const addInitObligationForFarm = true;
 
@@ -958,6 +960,7 @@ export class KaminoAction {
     },
     referrer: Option<Address> = none(),
     currentSlot: Slot = 0n,
+    payer: TransactionSigner = owner,
     overrideElevationGroupRequest?: number,
     // Optional customizations which may be needed if the obligation was mutated by some previous ix.
     obligationCustomizations?: {
@@ -973,7 +976,8 @@ export class KaminoAction {
       kaminoMarket,
       obligation,
       referrer,
-      currentSlot
+      currentSlot,
+      payer
     );
     const addInitObligationForFarm = true;
 
@@ -2644,7 +2648,7 @@ export class KaminoAction {
       if (!ownerUserMetadata && !initUserMetadata.skipInitialization) {
         let lookupTable: Address = DEFAULT_PUBLIC_KEY;
         if (!initUserMetadata.skipLutCreation) {
-          const [createLutIx, lookupTableAddress] = await createLookupTableIx(this.kaminoMarket.getRpc(), this.owner);
+          const [createLutIx, lookupTableAddress] = await createLookupTableIx(this.kaminoMarket.getRpc(), this.payer);
           lookupTable = lookupTableAddress;
           this.setupIxs.push(createLutIx);
           this.setupIxsLabels.push(`createUserLutIx[${lookupTableAddress}]`);
@@ -3026,7 +3030,7 @@ export class KaminoAction {
       const args: InitObligationFarmsForReserveArgs = { mode: arg[0] };
       const accounts: InitObligationFarmsForReserveAccounts = {
         owner: isKaminoObligation(this.obligation) ? this.obligation.state.owner : this.owner.address,
-        payer: this.owner,
+        payer: this.payer,
         obligation: obligationAddress,
         lendingMarketAuthority,
         reserve: reserve.address,
@@ -3115,7 +3119,7 @@ export class KaminoAction {
     const initReferrerTokenStateIx = initReferrerTokenState(
       {
         lendingMarket: this.kaminoMarket.getAddress(),
-        payer: this.owner,
+        payer: this.payer,
         reserve: reserve.address,
         referrer: this.referrer.value,
         referrerTokenState,
@@ -3169,7 +3173,7 @@ export class KaminoAction {
     if ((action === 'withdraw' || action === 'borrow' || action === 'redeem') && this.mint !== WRAPPED_SOL_MINT) {
       const reserveAta = await this.getUserTokenAccountAddress(this.reserve);
       const [, createUserTokenAccountIx] = await createAssociatedTokenAccountIdempotentInstruction(
-        this.owner,
+        this.payer,
         this.reserve.getLiquidityMint(),
         this.owner.address,
         this.reserve.getLiquidityTokenProgram(),
@@ -3187,7 +3191,7 @@ export class KaminoAction {
       const outflowReserveAta = await this.getUserTokenAccountAddress(this.outflowReserve);
 
       const [, createUserTokenAccountIx] = await createAssociatedTokenAccountIdempotentInstruction(
-        this.owner,
+        this.payer,
         this.outflowReserve.getLiquidityMint(),
         this.owner.address,
         this.outflowReserve.getLiquidityTokenProgram(),
@@ -3199,7 +3203,7 @@ export class KaminoAction {
 
       const ctokenAta = await this.getUserCollateralAccountAddress(this.outflowReserve);
       const [, createUserCollateralAccountIx] = await createAssociatedTokenAccountIdempotentInstruction(
-        this.owner,
+        this.payer,
         this.outflowReserve.getCTokenMint(),
         this.owner.address,
         TOKEN_PROGRAM_ADDRESS,
@@ -3224,7 +3228,7 @@ export class KaminoAction {
 
       if (!additionalUserTokenAccountInfo.exists) {
         const [, createUserTokenAccountIx] = await createAssociatedTokenAccountIdempotentInstruction(
-          this.owner,
+          this.payer,
           this.outflowReserve.getLiquidityMint(),
           this.owner.address,
           this.outflowReserve.getLiquidityTokenProgram(),
@@ -3239,7 +3243,7 @@ export class KaminoAction {
     if (action === 'withdraw' || action === 'mint' || action === 'deposit' || action === 'repayAndWithdraw') {
       const reserveAta = await this.getUserTokenAccountAddress(this.reserve);
       const [, createUserTokenAccountIx] = await createAssociatedTokenAccountIdempotentInstruction(
-        this.owner,
+        this.payer,
         this.reserve.getLiquidityMint(),
         this.owner.address,
         this.reserve.getLiquidityTokenProgram(),
@@ -3251,7 +3255,7 @@ export class KaminoAction {
     if (action === 'mint') {
       const ctokenAta = await this.getUserCollateralAccountAddress(this.reserve);
       const [, createUserCollateralAccountIx] = await createAssociatedTokenAccountIdempotentInstruction(
-        this.owner,
+        this.payer,
         this.reserve.getCTokenMint(),
         this.owner.address,
         TOKEN_PROGRAM_ADDRESS,
