@@ -409,6 +409,7 @@ async function getDepositTargetCollIxs(
     { skipInitialization: true, skipLutCreation: true }, // we are dealing with an existing obligation, no need to create user metadata
     context.referrer,
     context.currentSlot,
+    context.owner, // payer
     removesElevationGroup ? 0 : undefined // only applicable when removing the group
   );
   return {
@@ -458,6 +459,7 @@ async function getWithdrawSourceCollIxs(
     { skipInitialization: true, skipLutCreation: true }, // we are dealing with an existing obligation, no need to create user metadata
     context.referrer,
     context.currentSlot,
+    context.owner, // payer
     requestedElevationGroup,
     context.obligation.deposits.has(context.targetCollReserve.address) // if our obligation already had the target coll...
       ? undefined // ... then we need no customizations here, but otherwise...
