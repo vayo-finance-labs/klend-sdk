@@ -29,6 +29,7 @@
   "scripts": {
     "docs": "typedoc",
     "build": "rm -rf dist/; tsc",
+    "build:codegen": "rm -rf dist/ && tsc --skipLibCheck && cp -r src/idl dist/ && cp -r src/@codegen dist/",
     "build:watch": "yarn tsc --watch",
     "test-v2": "USE_V2=true yarn test",
     "test-kvaults": "yarn ts-mocha ./tests/kvaults/**/*.test.ts --parallel --exit",
