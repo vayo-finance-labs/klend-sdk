@@ -59,10 +59,10 @@ import {
   parseOracleType,
   parseTokenSymbol,
   Reserve,
+  ReserveConfigUpdateIx,
   ReserveWithAddress,
   ScopeOracleConfig,
   setOrAppend,
-  updateEntireReserveConfigIx,
   updateLendingMarket,
   UpdateLendingMarketAccounts,
   UpdateLendingMarketArgs,
@@ -199,42 +199,44 @@ export class KaminoManager {
    * @returns reserve - keypair used for reserve creation -> to be signed with when executing the transaction
    * @returns txnIxs - an array of arrays of ixs -> first array for reserve creation, second for updating it with correct params
    */
-  async addAssetToMarketIxs(
-    params: AddAssetToMarketParams
-  ): Promise<{ reserve: TransactionSigner; txnIxs: Instruction[][] }> {
+  async addAssetToMarketIxs(params: AddAssetToMarketParams): Promise<{
+    createReserveIxs: Instruction[];
+    configUpdateIxs: ReserveConfigUpdateIx[];
+  }> {
     const market = await LendingMarket.fetch(this._rpc, params.marketAddress, this._kaminoLendProgramId);
     if (!market) {
       throw new Error('Market not found');
     }
     const marketWithAddress: MarketWithAddress = { address: params.marketAddress, state: market };
 
-    const reserveAccount = await generateKeyPairSigner();
+    const reserve = await Reserve.fetch(this._rpc, params.reserveKeypair.address, this._kaminoLendProgramId);
 
-    const createReserveInstructions = await createReserveIxs(
-      this._rpc,
-      params.admin,
-      params.adminLiquiditySource,
-      params.marketAddress,
-      params.assetConfig.mint,
-      params.assetConfig.mintTokenProgram,
-      reserveAccount,
-      this._kaminoLendProgramId
-    );
+    let createReserveInstructions: Instruction[] = [];
+    if (!reserve) {
+      createReserveInstructions = await createReserveIxs(
+        this._rpc,
+        params.admin,
+        params.adminLiquiditySource,
+        params.marketAddress,
+        params.assetConfig.mint,
+        params.assetConfig.mintTokenProgram,
+        params.reserveKeypair,
+        this._kaminoLendProgramId
+      );
+    } else {
+      console.log('Reserve already exists, skipping creation');
+    }
 
-    const updateReserveInstructions = await this.updateReserveIxs(
+    const configUpdateIxs = await this.updateReserveIxs(
       params.admin,
       marketWithAddress,
-      reserveAccount.address,
+      params.reserveKeypair.address,
       params.assetConfig.getReserveConfig(),
       undefined,
-      false
+      params.globalAdminSigner
     );
 
-    const txnIxs: Instruction[][] = [];
-    txnIxs.push(createReserveInstructions);
-    txnIxs.push(updateReserveInstructions);
-
-    return { reserve: reserveAccount, txnIxs };
+    return { createReserveIxs: createReserveInstructions, configUpdateIxs };
   }
 
   /**
@@ -537,18 +539,26 @@ export class KaminoManager {
       },
     });
 
-    return this.updateReserveIxs(lendingMarketOwner, market, reserve.address, newReserveConfig, reserve.state);
+    const updateIxs = await this.updateReserveIxs(
+      lendingMarketOwner,
+      market,
+      reserve.address,
+      newReserveConfig,
+      reserve.state
+    );
+    return updateIxs.map((item) => item.ix);
   }
 
   /**
-   * This function updates the given reserve with a new config. It can either update the entire reserve config or just update fields which differ between given reserve and existing reserve
+   * This function updates the given reserve with a new config. It updates fields which differ between given reserve config and existing reserve config
    * @param lendingMarketOwner - market authority
    * @param marketWithAddress - the market that owns the reserve to be updated
    * @param reserve - the reserve to be updated
    * @param config - the new reserve configuration to be used for the update
    * @param reserveStateOverride - the reserve state, useful to provide, if already fetched outside this method, in order to avoid an extra rpc call to fetch it. Make sure the reserveConfig has not been updated since fetching the reserveState that you pass in.
-   * @param updateEntireConfig - when set to false, it will only update fields that are different between @param config and reserveState.config, set to true it will always update entire reserve config. An entire reserveConfig update might be too large for a multisig transaction
-   * @returns - an array of multiple update ixs. If there are many fields that are being updated without the updateEntireConfig=true, multiple transactions might be required to fit all ixs.
+   * @param globalAdminSigner - optional global admin signer for config modes that require it
+   * @returns - an array of update instructions with metadata indicating if global admin is required as signer.
+   * If there are many fields that are being updated, multiple transactions might be required to fit all ixs.
    */
   async updateReserveIxs(
     lendingMarketOwner: TransactionSigner,
@@ -556,35 +566,25 @@ export class KaminoManager {
     reserve: Address,
     config: ReserveConfig,
     reserveStateOverride?: Reserve,
-    updateEntireConfig: boolean = false
-  ): Promise<Instruction[]> {
+    globalAdminSigner?: TransactionSigner
+  ): Promise<ReserveConfigUpdateIx[]> {
     const reserveState = reserveStateOverride
       ? reserveStateOverride
       : (await Reserve.fetch(this._rpc, reserve, this._kaminoLendProgramId))!;
-    const ixs: Instruction[] = [];
 
-    if (!reserveState || updateEntireConfig) {
-      ixs.push(
-        await updateEntireReserveConfigIx(
-          lendingMarketOwner,
-          marketWithAddress.address,
-          reserve,
-          config,
-          this._kaminoLendProgramId
-        )
-      );
-    } else {
-      ixs.push(
-        ...(await parseForChangesReserveConfigAndGetIxs(
-          marketWithAddress,
-          reserveState,
-          reserve,
-          config,
-          this._kaminoLendProgramId,
-          lendingMarketOwner
-        ))
-      );
-    }
+    const ixs: ReserveConfigUpdateIx[] = [];
+
+    ixs.push(
+      ...(await parseForChangesReserveConfigAndGetIxs(
+        marketWithAddress,
+        reserveState,
+        reserve,
+        config,
+        this._kaminoLendProgramId,
+        lendingMarketOwner,
+        globalAdminSigner
+      ))
+    );
 
     return ixs;
   }
@@ -596,6 +596,7 @@ export class KaminoManager {
    * @param tokenAmount - token amount to be deposited, in decimals (will be converted in lamports)
    * @param [vaultReservesMap] - optional parameter; a hashmap from each reserve pubkey to the reserve state. Optional. If provided the function will be significantly faster as it will not have to fetch the reserves
    * @param [farmState] - the state of the vault farm, if the vault has a farm. Optional. If not provided, it will be fetched
+   * @param [memo] - optional memo string to append as a memo SPL instruction
    * @returns - an instance of DepositIxs which contains the instructions to deposit in vault and the instructions to stake the shares in the farm if the vault has a farm
    */
   async depositToVaultIxs(
@@ -604,9 +605,10 @@ export class KaminoManager {
     tokenAmount: Decimal,
     vaultReservesMap?: Map<Address, KaminoReserve>,
     farmState?: FarmState,
-    payer?: TransactionSigner
+    payer?: TransactionSigner,
+    memo?: string
   ): Promise<DepositIxs> {
-    return this._vaultClient.depositIxs(user, vault, tokenAmount, vaultReservesMap, farmState, payer);
+    return this._vaultClient.depositIxs(user, vault, tokenAmount, vaultReservesMap, farmState, payer, memo);
   }
 
   /**
@@ -955,7 +957,7 @@ export class KaminoManager {
    * Get all lending markets
    * @returns an array of all lending markets
    */
-  async getAllMarkets(programId: Address = PROGRAM_ID): Promise<KaminoMarket[]> {
+  async getAllMarkets(programId: Address = this._kaminoLendProgramId): Promise<KaminoMarket[]> {
     // Get all lending markets
     const marketGenerator = getAllLendingMarketAccounts(this.getRpc(), programId);
 

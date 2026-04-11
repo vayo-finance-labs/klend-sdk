@@ -1,4 +1,5 @@
 import BN from 'bn.js';
+import { getAddMemoInstruction } from '@solana-program/memo';
 import {
   Account,
   AccountRole,
@@ -118,6 +119,8 @@ import {
 import { getAccountOwner, getProgramAccounts } from '../utils';
 import {
   AcceptVaultOwnershipIxs,
+  AllDepositAccounts,
+  AllWithdrawAccounts,
   APYs,
   CreateVaultFarm,
   DepositIxs,
@@ -1893,6 +1896,7 @@ export class KaminoVaultClient {
    * @param tokenAmount - token amount to be deposited, in decimals (will be converted in lamports)
    * @param [vaultReservesMap] - optional parameter; a hashmap from each reserve pubkey to the reserve state. Optional. If provided the function will be significantly faster as it will not have to fetch the reserves
    * @param [farmState] - the state of the vault farm, if the vault has a farm. Optional. If not provided, it will be fetched
+   * @param [memo] - optional memo string to append as a memo SPL instruction
    * @returns - an instance of DepositIxs which contains the instructions to deposit in vault and the instructions to stake the shares in the farm if the vault has a farm as well as ixs to stake in the first loss capital farm if the vault has one - only one set on ixs so stake in a farm can be used -> staking can be either done in the farm or in the first loss capital farm
    */
   async depositIxs(
@@ -1901,7 +1905,8 @@ export class KaminoVaultClient {
     tokenAmount: Decimal,
     vaultReservesMap?: Map<Address, KaminoReserve>,
     farmState?: FarmState,
-    payer?: TransactionSigner
+    payer?: TransactionSigner,
+    memo?: string
   ): Promise<DepositIxs> {
     let vaultFarmState = farmState;
     const vaultState = await vault.getState();
@@ -1915,7 +1920,7 @@ export class KaminoVaultClient {
         vaultFarmState = vaultFarmStateResult;
       }
     }
-    return this.buildShareEntryIxs('deposit', user, vault, tokenAmount, vaultReservesMap, vaultFarmState, payer);
+    return this.buildShareEntryIxs('deposit', user, vault, tokenAmount, vaultReservesMap, vaultFarmState, payer, memo);
   }
 
   async buySharesIxs(
@@ -1936,7 +1941,8 @@ export class KaminoVaultClient {
     tokenAmount: Decimal,
     vaultReservesMap?: Map<Address, KaminoReserve>,
     farmState?: FarmState,
-    payer?: TransactionSigner
+    payer?: TransactionSigner,
+    memo?: string
   ): Promise<DepositIxs> {
     const vaultState = await vault.getState();
 
@@ -2034,6 +2040,10 @@ export class KaminoVaultClient {
       stakeInFlcFarmIfNeededIxs: [],
     };
 
+    if (memo) {
+      result.depositIxs.unshift(getAddMemoInstruction({ memo, signers: [user] }));
+    }
+
     if (await vault.hasFarm()) {
       const stakeSharesIxs = await this.stakeSharesIxs(user, vault, undefined, farmState);
       result.stakeInFarmIfNeededIxs = stakeSharesIxs;
@@ -2042,6 +2052,176 @@ export class KaminoVaultClient {
       const stakeSharesInFlcFarmIxs = await this.stakeSharesInFlcFarmIxs(user, vault, undefined, undefined);
       result.stakeInFlcFarmIfNeededIxs = stakeSharesInFlcFarmIxs;
     }
+    return result;
+  }
+
+  /**
+   * Returns the accounts needed for a vault deposit instruction, without building the instruction itself.
+   * Includes the deposit accounts, the remaining accounts for vault reserves, and optionally the stake shares instructions if the vault has a farm.
+   * @param user - the user depositing into the vault
+   * @param vault - the vault to deposit into
+   * @param [vaultReservesMap] - optional preloaded reserve states; if not provided they will be fetched
+   * @param [farmState] - optional preloaded farm state; if not provided and the vault has a farm, it will be fetched
+   * @returns the deposit accounts, remaining accounts, and optional stake shares instructions
+   */
+  async getDepositAccounts(
+    user: TransactionSigner,
+    vault: KaminoVault,
+    vaultReservesMap?: Map<Address, KaminoReserve>,
+    farmState?: FarmState
+  ): Promise<AllDepositAccounts> {
+    const vaultState = await vault.getState();
+    const tokenProgramID = vaultState.tokenProgram;
+    const userTokenAta = await getAssociatedTokenAddress(vaultState.tokenMint, user.address, tokenProgramID);
+    const userSharesAta = await getAssociatedTokenAddress(vaultState.sharesMint, user.address);
+    const eventAuthority = await getEventAuthorityPda(this._kaminoVaultProgramId);
+
+    const depositAccounts: DepositAccounts = {
+      user,
+      vaultState: vault.address,
+      tokenVault: vaultState.tokenVault,
+      tokenMint: vaultState.tokenMint,
+      baseVaultAuthority: vaultState.baseVaultAuthority,
+      sharesMint: vaultState.sharesMint,
+      userTokenAta,
+      userSharesAta,
+      tokenProgram: tokenProgramID,
+      klendProgram: this._kaminoLendProgramId,
+      sharesTokenProgram: TOKEN_PROGRAM_ADDRESS,
+      eventAuthority,
+      program: this._kaminoVaultProgramId,
+    };
+
+    const vaultReserves = this.getVaultReserves(vaultState);
+    const vaultReservesState = vaultReservesMap ? vaultReservesMap : await this.loadVaultReserves(vaultState);
+    const remainingAccounts = this.buildRemainingAccountsForVaultReserves(vaultReserves, vaultReservesState);
+
+    const result: AllDepositAccounts = {
+      depositAccounts,
+      remainingAccounts,
+    };
+
+    if (await vault.hasFarm()) {
+      const stakeSharesIxs = await this.stakeSharesIxs(user, vault, undefined, farmState);
+      result.stakeSharesIxs = stakeSharesIxs;
+    }
+
+    return result;
+  }
+
+  /**
+   * Returns the accounts needed for a vault withdraw instruction, without building the instruction itself.
+   * If a reserve is provided, builds the full WithdrawAccounts (withdraw from reserve). Otherwise builds WithdrawFromAvailableAccounts (withdraw from available liquidity only).
+   * Also includes remaining accounts for vault reserves and optionally the unstake instructions if the vault has a farm.
+   * @param user - the user withdrawing from the vault
+   * @param vault - the vault to withdraw from
+   * @param [reserve] - optional reserve to withdraw from; if omitted, builds accounts for withdrawing from available liquidity only
+   * @param [vaultReservesMap] - optional preloaded reserve states; if not provided they will be fetched
+   * @param [farmState] - optional preloaded farm state; if not provided and the vault has a farm, it will be fetched
+   * @returns the withdraw accounts, remaining accounts, and optional unstake shares instructions
+   */
+  async getWithdrawAccounts(
+    user: TransactionSigner,
+    vault: KaminoVault,
+    reserve?: ReserveWithAddress,
+    vaultReservesMap?: Map<Address, KaminoReserve>,
+    farmState?: FarmState
+  ): Promise<AllWithdrawAccounts> {
+    const vaultState = await vault.getState();
+    const userTokenAta = await getAssociatedTokenAddress(vaultState.tokenMint, user.address, vaultState.tokenProgram);
+    const userSharesAta = await getAssociatedTokenAddress(vaultState.sharesMint, user.address);
+
+    const globalConfig = await getKvaultGlobalConfigPda(this._kaminoVaultProgramId);
+    const eventAuthority = await getEventAuthorityPda(this._kaminoVaultProgramId);
+
+    let withdrawAccounts: WithdrawAccounts | WithdrawFromAvailableAccounts;
+
+    if (reserve) {
+      const marketAddress = reserve.state.lendingMarket;
+      const [lendingMarketAuth] = await lendingMarketAuthPda(marketAddress, this._kaminoLendProgramId);
+
+      withdrawAccounts = {
+        withdrawFromAvailable: {
+          user,
+          vaultState: vault.address,
+          globalConfig,
+          tokenVault: vaultState.tokenVault,
+          baseVaultAuthority: vaultState.baseVaultAuthority,
+          userTokenAta,
+          tokenMint: vaultState.tokenMint,
+          userSharesAta,
+          sharesMint: vaultState.sharesMint,
+          tokenProgram: vaultState.tokenProgram,
+          sharesTokenProgram: TOKEN_PROGRAM_ADDRESS,
+          klendProgram: this._kaminoLendProgramId,
+          eventAuthority,
+          program: this._kaminoVaultProgramId,
+        },
+        withdrawFromReserveAccounts: {
+          vaultState: vault.address,
+          reserve: reserve.address,
+          ctokenVault: await getCTokenVaultPda(vault.address, reserve.address, this._kaminoVaultProgramId),
+          lendingMarket: marketAddress,
+          lendingMarketAuthority: lendingMarketAuth,
+          reserveLiquiditySupply: reserve.state.liquidity.supplyVault,
+          reserveCollateralMint: reserve.state.collateral.mintPubkey,
+          reserveCollateralTokenProgram: TOKEN_PROGRAM_ADDRESS,
+          instructionSysvarAccount: SYSVAR_INSTRUCTIONS_ADDRESS,
+        },
+        eventAuthority,
+        program: this._kaminoVaultProgramId,
+      } as WithdrawAccounts;
+    } else {
+      withdrawAccounts = {
+        user,
+        vaultState: vault.address,
+        globalConfig,
+        tokenVault: vaultState.tokenVault,
+        baseVaultAuthority: vaultState.baseVaultAuthority,
+        userTokenAta,
+        tokenMint: vaultState.tokenMint,
+        userSharesAta,
+        sharesMint: vaultState.sharesMint,
+        tokenProgram: vaultState.tokenProgram,
+        sharesTokenProgram: TOKEN_PROGRAM_ADDRESS,
+        klendProgram: this._kaminoLendProgramId,
+        eventAuthority,
+        program: this._kaminoVaultProgramId,
+      } as WithdrawFromAvailableAccounts;
+    }
+
+    const vaultReserves = this.getVaultReserves(vaultState);
+    const vaultReservesState = vaultReservesMap ? vaultReservesMap : await this.loadVaultReserves(vaultState);
+    const remainingAccounts = this.buildRemainingAccountsForVaultReserves(vaultReserves, vaultReservesState);
+
+    const result: AllWithdrawAccounts = {
+      withdrawAccounts,
+      remainingAccounts,
+    };
+
+    const hasFarm = await vault.hasFarm();
+    if (hasFarm) {
+      let vaultFarmState = farmState;
+      if (!vaultFarmState) {
+        const vaultFarmStateResult = await FarmState.fetch(
+          this.getConnection(),
+          vaultState.vaultFarm,
+          this._farmsProgramId
+        );
+        if (vaultFarmStateResult) {
+          vaultFarmState = vaultFarmStateResult;
+        }
+      }
+      const unstakeIxs = await getFarmUnstakeAndWithdrawIxs(
+        this.getConnection(),
+        user,
+        new Decimal(U64_MAX.toString()),
+        vaultState.vaultFarm,
+        vaultFarmState
+      );
+      result.unstakeSharesIxs = [unstakeIxs.unstakeIx, unstakeIxs.withdrawIx];
+    }
+
     return result;
   }
 
@@ -3824,6 +4004,9 @@ export class KaminoVaultClient {
   }
 
   private async loadReserializedReserves(vaultReservesAddresses: Address[]) {
+    if (vaultReservesAddresses.length === 0) {
+      return [];
+    }
     const reserveAccounts = await this.getConnection()
       .getMultipleAccounts(vaultReservesAddresses, { commitment: 'processed' })
       .send();
@@ -5427,11 +5610,10 @@ export class KaminoVaultClient {
     return ixs;
   }
 
-  private appendRemainingAccountsForVaultReserves(
-    ix: Instruction,
+  private buildRemainingAccountsForVaultReserves(
     vaultReserves: Address[],
     vaultReservesState: Map<Address, KaminoReserve>
-  ): Instruction {
+  ): AccountMeta[] {
     let vaultReservesAccountMetas: AccountMeta[] = [];
     let vaultReservesLendingMarkets: AccountMeta[] = [];
     vaultReserves.forEach((reserve) => {
@@ -5444,9 +5626,18 @@ export class KaminoVaultClient {
         { address: reserveState.state.lendingMarket, role: AccountRole.READONLY },
       ]);
     });
+    return [...vaultReservesAccountMetas, ...vaultReservesLendingMarkets];
+  }
+
+  private appendRemainingAccountsForVaultReserves(
+    ix: Instruction,
+    vaultReserves: Address[],
+    vaultReservesState: Map<Address, KaminoReserve>
+  ): Instruction {
+    const remainingAccounts = this.buildRemainingAccountsForVaultReserves(vaultReserves, vaultReservesState);
     return {
       ...ix,
-      accounts: ix.accounts?.concat([...vaultReservesAccountMetas, ...vaultReservesLendingMarkets]),
+      accounts: ix.accounts?.concat(remainingAccounts),
     };
   }
 } // KaminoVaultClient
@@ -5598,6 +5789,7 @@ export class KaminoVault {
    * @param tokenAmount - token amount to be deposited, in decimals (will be converted in lamports)
    * @param [vaultReservesMap] - optional parameter; a hashmap from each reserve pubkey to the reserve state. Optional. If provided the function will be significantly faster as it will not have to fetch the reserves
    * @param [farmState] - the state of the vault farm, if the vault has a farm. Optional. If not provided, it will be fetched
+   * @param [memo] - optional memo string to append as a memo SPL instruction
    * @returns - an instance of DepositIxs which contains the instructions to deposit in vault and the instructions to stake the shares in the farm if the vault has a farm
    */
   async depositIxs(
@@ -5605,12 +5797,13 @@ export class KaminoVault {
     tokenAmount: Decimal,
     vaultReservesMap?: Map<Address, KaminoReserve>,
     farmState?: FarmState,
-    payer?: TransactionSigner
+    payer?: TransactionSigner,
+    memo?: string
   ): Promise<DepositIxs> {
     if (vaultReservesMap) {
       this.vaultReservesStateCache = vaultReservesMap;
     }
-    return this.client.depositIxs(user, this, tokenAmount, this.vaultReservesStateCache, farmState, payer);
+    return this.client.depositIxs(user, this, tokenAmount, this.vaultReservesStateCache, farmState, payer, memo);
   }
 
   /**

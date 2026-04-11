@@ -506,11 +506,14 @@ export class KaminoMarket {
   ): Decimal {
     return obligation
       ? obligation.getMaxBorrowAmount(this, debtReserve.getLiquidityMint(), slot, requestElevationGroup)
-      : debtReserve.getMaxBorrowAmountWithCollReserve(this, collReserve, slot);
+      : debtReserve.getMaxBorrowAmountWithCollReserve(this, collReserve);
   }
 
   async loadReserves(oracleAccounts?: AllOracleAccounts) {
     const addresses = [...this.reserves.keys()];
+    if (addresses.length === 0) {
+      return;
+    }
     const reserveAccounts = await this.rpc
       .getMultipleAccounts(addresses, { commitment: 'processed', encoding: 'base64' })
       .send();
